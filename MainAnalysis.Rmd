@@ -1,0 +1,458 @@
+---
+title: "Working code for project MLcorrect"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Explaining Data Structure
+
+All of the data, features, and sample information are already summarized in the `summarizedExperiment` object stored in `m6Ads.rds`. 
+
+We need to load the m6A data set into R with the following command:
+```{r, eval=TRUE, warning=FALSE, message=FALSE}
+library(SummarizedExperiment)
+m6Ads <- readRDS("m6Ads.rds")
+m6Ads
+```
+
+We can access sample information including the cell types, biological treatments, and sequencing techniques with:
+```{r, eval=FALSE}
+colData(m6Ads)
+```
+
+We can access the targets (Y) of Machine Learning models for each sample with:
+```{r, eval=FALSE}
+assay(m6Ads)
+```
+Each column is a sample of m6A experiment, 1 is m6A positive labeling, 0 is the m6A negative labeling, NA is unknown labeling (neither positive nor negative for that sample/column). 
+
+Each row is a DRACH site that is either a m6A or a m6A-negative site, all rows correspond to single-based GRanges which can be accessed by `rowRanges(m6Ads)`.
+
+Please notice that all of the training datasets in this matrix are balanced, which can be verified using:
+```{r}
+apply(assay(m6Ads), 2, table)
+```
+
+We can access the potential technical features used for correction with:
+```{r, eval=FALSE}
+metadata(m6Ads)[[1]]
+```
+
+Each column is a fragment GC content defined on a given flanking sizes (from 1 to 250).
+
+We can access the biological features used in machine learning with:
+```{r, eval=FALSE}
+rowData(m6Ads)
+```
+
+## Basic hypothesis
+
+The low overlapping between different samples of SB m6A modification is due to 2 reasons:
+1. The general low background probabilities of positive, so many sites are "missing" due to the in general low binomial probabilities for potential positive sites, but the underlying probability profile for different samples should be same.
+
+2. The existing biased model generating profile is mostly due to the traceable sequencing artifacts derived by GC content, which can be effectively estimated using statistical approach and included in the modeling offsets.
+
+## Basic Experiments
+
+- The hypothesis 1 is going to be verified by plotting the pearson correlation of probabilities of ML model and compared with the pearson correlation using the raw binomial data vectors.
+
+- The hypothesis 2 is going to be verified by employing the correction model, and thus having better predictive consistency between samples. (predictive consistency can be correlation of model fitted values + box plot of cross sample AUROC)
+
+2 methods of correction will be employed, the flattening correction and the reference based correction, both the effects of those 2 correction methods would be examined later. 
+
+## Sub hypothesis and experiments
+
+1. Using a simulation for the sensitivity issue, we could be able to see that the positive position is going to generate signal with a constant probability estimated from the data, then we would be able to see a very similar distribution of the correlation / limited overlapping rates. (observed distribution plot against simulated distribution)
+
+2. GC content bias is promenent in some sample, as some samples's GC content may derived from a certain range of GC (either extreamly high or low).
+
+3. The bias can be mostly overcome by the ML approach corrected by technical biases, where the bias is neutralized using either the model offsets or the adjustment directly on the predicted probabilities. The evidence for bias to be neutralized can be viewed using box plot/density plot.
+
+## Feature selection with deviances
+
+Deviance exploration
+```{r}
+# save sample number variable.
+N <- ncol(m6Ads)
+
+Null_Deviance <- matrix(nrow = ncol(metadata(m6Ads)[[1]]), ncol = N)
+Residual_Deviance <- matrix(nrow = ncol(metadata(m6Ads)[[1]]), ncol = N)
+
+for(i in seq_len(N)){
+ indx_i <- !is.na(assay(m6Ads)[,i])
+ for(j in 10:(ncol(metadata(m6Ads)[[1]]))){
+   Model <- glm(Y~splines::ns(GC,
+                              knots=quantile(GC, c(0.025, 0.25, 0.5, 0.75, 0.975))),
+                family = "binomial",
+                data=data.frame(GC = metadata(m6Ads)[[1]][indx_i,j],
+                                Y = assay(m6Ads)[indx_i,i]))
+   Residual_Deviance[j,i] <- Model$deviance
+   Null_Deviance[j,i] <- Model$null.deviance
+ }
+}
+
+write.csv(Null_Deviance, "Null_Deviance.csv")
+write.csv(Residual_Deviance, "Residual_Deviance.csv")
+
+Null_Deviance <- read.csv("Null_Deviance.csv")[,-1]
+Residual_Deviance <- read.csv("Residual_Deviance.csv")[,-1]
+
+Percent_deviance <- as.data.frame(na.omit(Residual_Deviance/Null_Deviance))
+min(Percent_deviance) #Too small
+colnames(Percent_deviance) <- paste0("sample_",1:N)
+plot_df <- reshape2::melt(Percent_deviance)
+plot_df$flanking_size <- rep(10:250,N)
+
+library(ggplot2)
+library(RColorBrewer)
+colourCount <- N
+getPalette <- colorRampPalette(brewer.pal(4, "Paired"))
+
+ggplot(plot_df, aes(x=flanking_size,y=value,colour = variable)) + geom_line() + labs(y = "% Residual Deviance", x = "GC Flanking Size") + theme_classic() + scale_colour_manual(values = getPalette(colourCount))
+
+ggsave("Deviances.pdf", width = 7, height = 4)
+
+colData(m6Ads)$optimized_flank <- apply(Residual_Deviance[-1*(1:20),],2,which.min) + 20
+```
+The first 20 residuals are masked, since they probably confounding with the biological effects within 20bp flanking regions (the flanking region of our one-hot sequence), so that any GC calculated within 41bp windows will not be reported even when they lead to the minimum deviance.
+
+## Run individual LR fit with nc splines and calculate the offsets used for correction 
+
+```{r}
+# fit and save models for each individual samples using the optimized GC
+dir.create("glmModels")
+
+for(i in seq_len(N)){
+indx_i <-!is.na(assay(m6Ads)[,i])
+Model_matrix <- data.frame(Y = assay(m6Ads)[indx_i,i],
+                           X = metadata(m6Ads)[[1]][indx_i,colData(m6Ads)$optimized_flank[i]])
+glmfit_i <- glm(Y~splines::ns(X, knots=quantile(Model_matrix$X, c(0.025, 0.25, 0.5, 0.75, 0.975))), data = Model_matrix, family = binomial(link = "logit"))
+saveRDS(glmfit_i, paste0("glmModels/glmfit_", i, ".rds"))
+}
+
+
+
+#Load the models and calculate their fits.
+inv_logistic <- function(x) exp(x)/(1+exp(x))
+
+fitted_matrix <- data.frame(X=seq(0,1,by=0.005))
+for(i in seq_len(N)){
+model_i <- readRDS(paste0("glmModels/glmfit_", i, ".rds"))
+fitted_matrix[[paste0("sample_",i)]] <- inv_logistic(predict.glm(model_i, fitted_matrix["X"]))
+}
+
+#Reproduce the same plot in ggplot2
+plot_df <- reshape2::melt( fitted_matrix[,-1] )
+colnames(plot_df) <- c("Sample", "LR_fit")
+plot_df$GC <- rep(fitted_matrix[["X"]], N)
+
+library(ggplot2)
+library(RColorBrewer)
+colourCount <- length(unique(plot_df$Sample)) # number of levels
+getPalette <- colorRampPalette(brewer.pal(4, "Paired"))
+
+ggplot(plot_df, aes(x = GC, y = LR_fit, colour = Sample)) + geom_line(size=1) + scale_colour_manual(values = getPalette(colourCount)) + theme_classic()
+ggsave("LR_fit_tech_GC_self.pdf", width = 7, height = 4)
+```
+Define the offsets calculating functions for each individual observations:
+
+```{r}
+offset_flattern <- function(gc_model,new_X){
+gc_fitted_val <- predict.glm(gc_model)
+offset <- predict.glm(gc_model,data.frame(X=new_X)) - mean(gc_fitted_val)
+return(offset)  
+}
+```
+
+## Building sample-wised ML models.
+
+Use the XGboost in h2o package to train prediction models
+```{r eval=FALSE}
+library(h2o)
+h2o.init()
+```
+
+```{r}
+for( i in seq_len(N) ){
+indx_i <- !is.na(assay(m6Ads)[,i])
+Model_matrix_i <- rowData(m6Ads)[indx_i, ]
+Model_matrix_i$GC_tech <- metadata(m6Ads)[[1]][indx_i, colData(m6Ads)$optimized_flank[i]]
+Model_matrix_i$Y <- as.factor(assay(m6Ads)[indx_i, i])
+
+predictors <- setdiff(colnames(Model_matrix_i), "Y")
+response <- "Y"
+
+# Split the dataset into train and valid
+model_matrix <- as.h2o(Model_matrix_i)
+splits <- h2o.splitFrame(data =  model_matrix, ratios = .8, seed = 1234)
+train <- splits[[1]]
+valid <- splits[[2]]
+
+# Train the XGB model
+Model_i_xgb <- h2o.xgboost(x = predictors, y = response,
+                           training_frame = model_matrix,
+                           model_id = paste0("sample_",i),
+                           nfolds = 10,
+                           booster = "gbtree", normalize_type = "tree",
+                           seed = 1234)
+
+# Save the XGB model on disk
+h2o.saveModel(Model_i_xgb, "xgboostModel")
+}
+```
+- Report the models peformance metrics under 10 folds CV.
+
+```{r}
+performance <- matrix(nrow = 5, ncol = N)
+rownames(performance) <- c("AUC","AUCPR", "MCC_05", "MCC_max","max_threshold")
+colnames(performance) <- paste0("sample_", seq_len(N))
+
+for(i in seq_len(N)){
+   model_i <- h2o.loadModel(paste0("xgboostModel/sample_", i))
+   performance[1,i] <- h2o.auc(model_i, xval = TRUE)
+   performance[2,i] <- h2o.aucpr(model_i, xval = TRUE)
+   mcc_i <- as.data.frame(h2o.mcc(h2o.performance(model_i, xval = TRUE)))
+   performance[3,i] <- mcc_i$absolute_mcc[which.min(abs(mcc_i$threshold-0.5))]
+   performance[4,i] <- max(mcc_i$absolute_mcc)
+   performance[5,i] <- mcc_i$threshold[which.max(mcc_i$absolute_mcc)]
+}
+
+write.csv(performance, "cv.performance.csv")
+```
+
+
+- Generate prediction probability assay
+
+
+```{r}
+
+full_feature <- as.h2o(cbind(rowData(m6Ads),GC_tech = metadata(m6Ads)[[1]][, colData(m6Ads)$optimized_flank[i]]))
+
+pred_assay <- matrix(NA, nrow = nrow(m6Ads), ncol = N)
+for(i in 1:26){
+   full_feature <- as.h2o(cbind(rowData(m6Ads),GC_tech = metadata(m6Ads)[[1]][, colData(m6Ads)$optimized_flank[i]]))
+   pred_assay[,i] <- as.vector(h2o.predict(h2o.loadModel(paste0("xgboostModel/sample_", i)), newdata = full_feature)$p1)
+}
+
+assays( m6Ads )[["Pred"]] <- pred_assay
+
+saveRDS(m6Ads, "../m6Ads.rds")
+
+pred_assay <- assays( m6Ads )[["Pred"]] 
+COR_pred <- cor(pred_assay)
+
+rownames(COR_pred) <- colData(m6Ads)$Technique
+colnames(COR_pred) <- colData(m6Ads)$CellType
+test <- COR_pred[apply(COR_pred, 1, function(x) sd(x)!=0),]
+pheatmap(test,scale = "row",cellwidth = 12,cellheight =6)
+pheatmap::pheatmap(COR_pred,cellwidth = 12,cellheight =7)
+```
+
+The results are in general a mess, no desirable clustering can be seen except the batch effects.
+
+```{r}
+offset_reference <- function(gc_model,reference_gc_model,new_X){
+gc_fitted_val <- predict.glm(gc_model)
+reference_fitted_val <- predict.glm(reference_gc_model)
+offset <- (predict.glm(gc_model, data.frame(X=new_X)) - mean(gc_fitted_val)) - (predict.glm(reference_gc_model, data.frame(X=new_X)) - mean(reference_fitted_val))
+return(offset) 
+}
+
+glmfit_ref <- readRDS("glmModels/glmfit_ref.rds")
+offset_ref_M <- matrix(NA, nrow = nrow(m6Ads), ncol = N)
+for(i in seq_len(N)){
+   glmfit_i <- readRDS(paste0("glmModels/glmfit_",i,".rds"))
+   offset_ref_M[,i] <- offset_reference(glmfit_i, glmfit_ref, metadata(m6Ads)[[1]][,colData(m6Ads)$optimized_flank[i]])
+}
+
+saveRDS(offset_ref_M, "offset_ref_M.rds")
+
+offset_flattern <- function(gc_model,new_X){
+gc_fitted_val <- predict.glm(gc_model)
+offset <- predict.glm(gc_model,data.frame(X=new_X)) - mean(gc_fitted_val)
+return(offset)  
+}
+offset_flat_M <- matrix(NA, nrow = nrow(m6Ads), ncol = N)
+for(i in seq_len(N)){
+   glmfit_i <- readRDS(paste0("glmModels/glmfit_",i,".rds"))
+   offset_flat_M[,i] <- offset_flattern(glmfit_i, metadata(m6Ads)[[1]][,colData(m6Ads)$optimized_flank[i]])
+}
+
+saveRDS(offset_flat_M, "offset_flat_M.rds")
+
+calculate_MCC_Matrix <- function(pred_assay, data_assay = NULL){
+pred_binary <- (pred_assay > 0.5)*1
+pairs <- expand.grid(seq_len(N),seq_len(N))
+MCC_M <- matrix(NA, nrow = N, ncol = N)
+MCC_M[as.matrix(pairs)] <- sapply(seq_len(nrow(pairs)),function(i){ 
+    smpl_1 <- pred_binary[,pairs[i,1]]
+    if(!is.null(data_assay)){
+    smpl_2 <- data_assay[,pairs[i,2]]     
+    }else{
+    smpl_2 <- pred_binary[,pairs[i,2]]  
+    }
+   conf_table <- table(smpl_1,smpl_2)+1
+   TP <- conf_table["1","1"]
+   FP <- conf_table["1","0"]
+   TN <- conf_table["0","0"]
+   FN <- conf_table["0","1"]
+   MCC <- (TP*TN - FP*FN)/sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN))
+   return(MCC)
+   })
+return(MCC_M)
+}
+
+MCC_raw <- calculate_MCC_Matrix(assays(m6Ads)[["Pred"]])
+MCC_pred <- calculate_MCC_Matrix(assays(m6Ads)[["Pred"]], assays(m6Ads)[["Model"]])
+MCC_norm_ref <- calculate_MCC_Matrix(inv_logistic(log(assays(m6Ads)[["Pred"]]/(1-assays(m6Ads)[["Pred"]])) - offset_ref_M), assays(m6Ads)[["Model"]])
+MCC_norm_flat <- calculate_MCC_Matrix(inv_logistic(log(assays(m6Ads)[["Pred"]]/(1-assays(m6Ads)[["Pred"]])) - offset_flat_M), assays(m6Ads)[["Model"]])
+
+
+mean(MCC_raw)
+mean(MCC_pred)
+mean(MCC_norm_ref)
+mean(MCC_norm_flat)
+
+indx <- colData(m6Ads)$CellType == "HEK293"
+mean(MCC_raw[indx,indx])
+mean(MCC_pred[indx,indx])
+mean(MCC_norm_ref[indx,indx])
+mean(MCC_norm_flat[indx,indx])
+
+pheatmap::pheatmap(MCC_norm_flat[indx,indx])
+
+diff_ref <- MCC_norm_ref - MCC_raw
+diff_flat <- MCC_norm_flat - MCC_raw
+rownames(diff_ref) <- colData(m6Ads)$Technique
+colnames(diff_ref) <- colData(m6Ads)$Technique
+rownames(diff_flat) <- colData(m6Ads)$Technique
+colnames(diff_flat) <- colData(m6Ads)$Technique
+pheatmap::pheatmap(diff_ref)
+pheatmap::pheatmap(diff_flat)
+```
+
+The hypothesis is able to verified using only the HEK293 dataset...
+
+Use Manvittney test to show the improvement in MCC
+
+##See if correction can save the matrix or not
+
+```{r}
+mean(cor(pred_assay))
+mean(cor(pred_assay - offset_ref_M)) #The hypothesis is rejected / reference profile method cannot correct for bias...
+COR_adj <- cor(pred_assay - offset_ref_M)
+
+rownames(COR_adj) <- colData(m6Ads)$Technique
+colnames(COR_adj) <- colData(m6Ads)$Technique
+pheatmap::pheatmap(COR_adj)
+
+COR_diff <- cor(pred_assay - offset_ref_M) - cor(pred_assay)
+
+rownames(COR_diff) <- colData(m6Ads)$Technique
+colnames(COR_diff) <- colData(m6Ads)$Technique
+pheatmap::pheatmap(COR_diff)
+
+COR_diff[1:4,1:4]
+```
+The datasets become more technical!
+
+```{r}
+offset_flattern <- function(gc_model,new_X){
+gc_fitted_val <- predict.glm(gc_model)
+offset <- predict.glm(gc_model,data.frame(X=new_X)) - mean(gc_fitted_val)
+return(offset)  
+}
+offset_flat_M <- matrix(NA, nrow = nrow(m6Ads), ncol = N)
+for(i in seq_len(N)){
+   glmfit_i <- readRDS(paste0("glmModels/glmfit_",i,".rds"))
+   offset_flat_M[,i] <- offset_flattern(glmfit_i, metadata(m6Ads)[[1]][,colData(m6Ads)$optimized_flank[i]])
+}
+
+saveRDS(offset_flat_M, "offset_flat_M.rds")
+
+mean(cor(pred_assay))
+mean(cor(pred_assay - offset_flat_M)) #The hypothesis is rejected / reference profile method cannot correct for bias...
+COR_adj <- cor(pred_assay - offset_flat_M)
+
+rownames(COR_adj) <- colData(m6Ads)$Technique
+colnames(COR_adj) <- colData(m6Ads)$Technique
+pheatmap::pheatmap(COR_adj)
+
+COR_diff <- cor(pred_assay - offset_flat_M) - cor(pred_assay)
+
+rownames(COR_diff) <- colData(m6Ads)$Technique
+colnames(COR_diff) <- colData(m6Ads)$Technique
+pheatmap::pheatmap(COR_diff)
+
+COR_diff[1:4,1:4]
+mean(COR_diff[indx,indx])
+pheatmap::pheatmap(COR_diff[indx,indx])
+
+pred_assay <- assays(m6Ads)[["Pred"]]
+pred_assay <- pred_assay[,colData(m6Ads)$CellType == "HEK293"]
+plot_df <- purrr::reduce( lapply(seq_len(ncol(pred_assay)), function(i) data.frame(GC = metadata(m6Ads)[[1]][pred_assay[,i] > 0.5,colData(m6Ads)$optimized_flank[i]], Sample = i)), rbind)
+
+ggplot(plot_df, aes(x = as.factor(Sample), y = GC)) + geom_boxplot() + theme_classic()
+
+pred_assay_c1 <- inv_logistic(log(assays(m6Ads)[["Pred"]]/(1-assays(m6Ads)[["Pred"]])) - offset_ref_M)
+
+pred_assay_c1 <- pred_assay_c1[,colData(m6Ads)$CellType == "HEK293"]
+plot_df_c1 <- purrr::reduce( lapply(seq_len(ncol(pred_assay_c1)), function(i) data.frame(GC = metadata(m6Ads)[[1]][pred_assay_c1[,i] > 0.5,colData(m6Ads)$optimized_flank[i]], Sample = i)), rbind)
+
+ggplot(plot_df_c1, aes(x = as.factor(Sample), y = GC)) + geom_boxplot() + theme_classic()
+
+pred_assay_c2 <- inv_logistic(log(assays(m6Ads)[["Pred"]]/(1-assays(m6Ads)[["Pred"]])) - offset_flat_M)
+
+pred_assay_c2 <- pred_assay_c2[,colData(m6Ads)$CellType == "HEK293"]
+plot_df_c2 <- purrr::reduce( lapply(seq_len(ncol(pred_assay_c2)), function(i) data.frame(GC = metadata(m6Ads)[[1]][pred_assay_c2[,i] > 0.5,colData(m6Ads)$optimized_flank[i]], Sample = i)), rbind)
+
+ggplot(plot_df_c2, aes(x = as.factor(Sample), y = GC)) + geom_boxplot() + theme_classic()
+```
+
+The result is only analyzable through DART-Seq + 2 specific MAZTER-Seq datasets.
+
+So after dis-select the unfavorable samples, the result can be very different.
+
+Targeted journal: frontiers in Genetics. It should be fine if we get an mutual improvement on AUROC/MCC.
+
+Tonight's target, subset the colData & calculate AUROC. (done it for MCC, not working for ML)
+
+## On the basics of data consistency
+```{r}
+pairs <- expand.grid(seq_len(N),seq_len(N))
+MCC_raw <- matrix(NA, nrow = N, ncol = N)
+MCC_raw[as.matrix(pairs)] <- sapply(seq_len(nrow(pairs)),function(i){ 
+    smpl_1 <- assay(m6Ads)[,pairs[i,1]]
+   smpl_2 <- assay(m6Ads)[,pairs[i,2]]
+   conf_table <- table(smpl_1,smpl_2)+1
+   TP <- conf_table["1","1"]
+   FP <- conf_table["1","0"]
+   TN <- conf_table["0","0"]
+   FN <- conf_table["0","1"]
+   MCC <- (TP*TN - FP*FN)/sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN))
+   return(MCC)
+   })
+saveRDS(MCC_raw, "MCC_raw.rds")
+rownames(MCC_raw) <- colData(m6Ads)$Technique
+colnames(MCC_raw) <- colData(m6Ads)$Technique
+pheatmap::pheatmap(MCC_raw) #The groups are clustered by techniques
+```
+
+## Gene Consistency Analysis
+
+```{r}
+
+```
+
+
+## Session Info
+
+```{r}
+sessionInfo()
+```
+
